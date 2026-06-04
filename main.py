@@ -2640,7 +2640,7 @@ def analyst_loop():
     # История ATR Map score для подсчёта mature_bars (сколько баров подряд score≥60).
     # Ключ: symbol → deque последних 12 score'ов (24h при cycle 6-7 мин).
     atr_map_score_history: dict = {}
-    logging.info("Аналитик Binance v7.3.9.4 (load_markets fix vs ban escalation) запущен.")
+    logging.info("Аналитик Binance v7.3.9.5 (sent-dict memory leak fix) запущен.")
 
     # v7.3: ждём окончания прогрева истории
     while warmup_state['phase'] != 'done':
@@ -3166,6 +3166,25 @@ def analyst_loop():
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
 
+            # ───────────────────────────────────────────────────────────
+            # v7.3.9.5: ОЧИСТКА sent_signals / sent_attention от старых ключей.
+            # БАГ ПАМЯТИ: эти словари накапливали ключи (symbol_barid_...) каждую
+            # итерацию для ~588 монет и НИКОГДА не чистились → за ~2ч десятки тысяч
+            # строк-ключей, которые gc не может собрать (на них есть ссылка) →
+            # RSS дорастал до 512МБ → OOM-рестарт каждые 2ч. malloc_trim тут
+            # бессилен: это живые объекты, а не свободные пулы glibc.
+            # Чистим записи старше 12ч — дедупликация в пределах 2H-бара (2-4ч)
+            # полностью сохраняется, удаляются только давно закрытые бары.
+            # (Аналог cleanup_loop из рабочего памп-бота.)
+            _now_ts = time.time()
+            _PRUNE_AGE = 12 * 3600  # 12 часов
+            _before = len(sent_attention) + len(sent_signals)
+            sent_attention = {k: v for k, v in sent_attention.items()
+                              if isinstance(v, (int, float)) and _now_ts - v < _PRUNE_AGE}
+            sent_signals = {k: v for k, v in sent_signals.items()
+                            if isinstance(v, (int, float)) and _now_ts - v < _PRUNE_AGE}
+            _pruned = _before - (len(sent_attention) + len(sent_signals))
+
             # v7.3.9.1: gc.collect() + malloc_trim() КАЖДУЮ итерацию.
             # analyst_loop создаёт ~1000+ временных list/dict за итерацию
             # (list(deque) для каждого символа × 3 ТФ + numpy arrays).
@@ -3181,7 +3200,9 @@ def analyst_loop():
                 _log_memory(f"gc_iter_{bot_status['iterations']}")
                 logging.info(
                     f"🧹 gc.collect (iter {bot_status['iterations']}): "
-                    f"освобождено {collected} объектов, malloc_trim={trimmed}"
+                    f"освобождено {collected} объектов, malloc_trim={trimmed}, "
+                    f"sent-ключей очищено {_pruned}, "
+                    f"sent_attention={len(sent_attention)}, sent_signals={len(sent_signals)}"
                 )
 
             logging.info(f"Итерация. Символов 2H: {len(all_perps_2h)} | "
@@ -3246,7 +3267,7 @@ def health():
     else:
         tickers_str = "❌ disconnected"
 
-    return (f"✅ OK | Binance v7.3.9.4 (load_markets fix vs ban escalation)\n"
+    return (f"✅ OK | Binance v7.3.9.5 (sent-dict memory leak fix)\n"
             f"Uptime: {uptime}\n"
             f"Итераций: {bot_status['iterations']}\n"
             f"Ошибок: {bot_status['errors']}\n"
