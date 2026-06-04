@@ -2640,7 +2640,7 @@ def analyst_loop():
     # История ATR Map score для подсчёта mature_bars (сколько баров подряд score≥60).
     # Ключ: symbol → deque последних 12 score'ов (24h при cycle 6-7 мин).
     atr_map_score_history: dict = {}
-    logging.info("Аналитик Binance v7.3.9.5 (sent-dict memory leak fix) запущен.")
+    logging.info("Аналитик Binance v7.3.9.6 (memory diagnostics) запущен.")
 
     # v7.3: ждём окончания прогрева истории
     while warmup_state['phase'] != 'done':
@@ -3195,7 +3195,39 @@ def analyst_loop():
             # Связка отрабатывает за ~10-50мс — на 60с-итерацию пренебрежимо.
             collected = gc.collect()
             trimmed = _malloc_trim()
-            # Подробный memory-лог раз в 10 итераций (чтобы не засорять логи).
+
+            # ───────────────────────────────────────────────────────────
+            # v7.3.9.6: ПРИНУДИТЕЛЬНАЯ ДИАГНОСТИКА ПАМЯТИ каждую итерацию.
+            # Через print(flush=True), а НЕ logging — чтобы гарантированно
+            # попасть в stdout логов Render (logging мог фильтроваться/теряться,
+            # почему поиск 'mem' ничего не находил). Печатаем RSS + размеры ВСЕХ
+            # живущих между итерациями структур, чтобы увидеть, ЧТО именно растёт.
+            try:
+                _rss = None
+                with open('/proc/self/status') as _f:
+                    for _l in _f:
+                        if _l.startswith('VmRSS:'):
+                            _rss = int(_l.split()[1]) / 1024
+                            break
+                # Суммарное число свечей во всех deque (главный подозреваемый по объёму)
+                with candles_lock:
+                    _cand_total = sum(len(d) for d in candles_storage.get('2h', {}).values())
+                    _cand_syms = len(candles_storage.get('2h', {}))
+                print(
+                    f"MEMDIAG iter={bot_status['iterations']} RSS={_rss:.1f}MB | "
+                    f"candles2h_syms={_cand_syms} candles2h_total={_cand_total} | "
+                    f"sent_att={len(sent_attention)} sent_sig={len(sent_signals)} | "
+                    f"score_hist={len(atr_map_score_history)} | "
+                    f"oi_hist={len(oi_history)} oi_cache={len(oi_cache)} "
+                    f"fund_cache={len(_funding_cache)} | "
+                    f"ws_tick={len(ws_tickers_cache)} freshness={len(candles_freshness)} "
+                    f"active={len(active_symbols)} | gc={collected} trim={trimmed}",
+                    flush=True
+                )
+            except Exception as _e:
+                print(f"MEMDIAG error: {_e}", flush=True)
+
+            # Подробный memory-лог раз в 10 итераций (старый, оставлен).
             if bot_status["iterations"] % 10 == 0:
                 _log_memory(f"gc_iter_{bot_status['iterations']}")
                 logging.info(
@@ -3267,7 +3299,7 @@ def health():
     else:
         tickers_str = "❌ disconnected"
 
-    return (f"✅ OK | Binance v7.3.9.5 (sent-dict memory leak fix)\n"
+    return (f"✅ OK | Binance v7.3.9.6 (memory diagnostics)\n"
             f"Uptime: {uptime}\n"
             f"Итераций: {bot_status['iterations']}\n"
             f"Ошибок: {bot_status['errors']}\n"
