@@ -22,6 +22,20 @@ from collections import deque
 # resource.getrusage даёт ru_maxrss в КБ на Linux (на macOS в байтах,
 # но мы на Render = Linux, так что просто /1024 для МБ).
 # ═══════════════════════════════════════════════════════════════════════
+def _get_rss_mb():
+    """v7.3.9.9: текущий RSS процесса в МБ (из /proc/self/status — точное
+    мгновенное значение, в отличие от ru_maxrss, который пиковый).
+    Возвращает float МБ или None если не удалось прочитать."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return None
+
+
 def _log_memory(tag: str):
     """Логирует текущее потребление памяти процессом.
     tag — короткая метка точки в коде."""
@@ -329,6 +343,15 @@ active_symbols_lock = threading.Lock()
 active_symbols: list = []
 active_symbols_updated_at = 0.0
 ACTIVE_SYMBOLS_REFRESH_SEC = 3600   # раз в час
+
+# v7.3.9.9 (план Б): reload markets для подхвата новых листингов — РЕДКО.
+# reload даёт всплеск ~100МБ (см. v7.3.9.7), поэтому делаем его раз в 10 дней
+# (240 часовых refresh'ей) И только если текущий RSS ниже порога — чтобы
+# всплеск гарантированно не пробил 512МБ Render. Между reload'ами список
+# монет строится из уже загруженного exchange.markets (нулевой всплеск).
+RELOAD_EVERY_N_REFRESH = 240        # 240 часов = 10 дней
+RELOAD_RSS_SAFETY_MB = 360          # reload только если RSS < 360МБ (пик ~460 < 512)
+_refresh_counter = 0                # счётчик hourly refresh'ей
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1840,15 +1863,25 @@ def _get_tickers_ws_or_rest(max_age_sec: int = 30):
             # итерировать без блокировки лока на всё время аналитики.
             return dict(ws_tickers_cache)
 
-    # Fallback на REST
+    # Fallback на REST — ТОЛЬКО если кэша вообще нет (самый первый вызов
+    # после деплоя, пока ws_tickers не подцепился).
+    # v7.3.9.10: КРИТИЧНО против банов. Раньше при устаревшем WS-кэше код
+    # БЕЗУСЛОВНО бил REST fetch_tickers (weight=40) КАЖДУЮ итерацию, пока WS
+    # не восстановится. Если WS залегал надолго (stale часами), это давало
+    # десятки тяжёлых REST-запросов → 418 ban. Теперь: если есть ХОТЬ КАКОЙ-ТО
+    # кэш (пусть устаревший) — возвращаем его, а не долбим REST. Тикеры нужны
+    # только для объёма (фильтры), секундная свежесть некритична — Сжатие
+    # считается по свечам (WS). REST только когда кэша нет совсем.
     if cache_size > 0:
         logging.warning(
             f"_get_tickers: WS-cache устарел ({cache_age:.0f}s > {max_age_sec}s), "
-            f"fallback на REST fetch_tickers"
+            f"возвращаем СТАРЫЙ кэш (REST не вызываем — защита от бана)"
         )
+        with ws_tickers_lock:
+            return dict(ws_tickers_cache)
     else:
         logging.info("_get_tickers: WS-cache пуст, первый вызов через REST")
-    return safe_api_call(exchange.fetch_tickers)
+        return safe_api_call(exchange.fetch_tickers)
 
 
 # Snapshot OI в памяти. Раз в итерацию записываем текущий OI.
@@ -2189,22 +2222,40 @@ def refresh_active_symbols(initial: bool = False):
     Сортирует по объёму (для приоритезации в прогреве).
     Вызывается раз в час из watchdog + при старте.
     v7.3.1: load_markets через _safe_load_markets — переживает 418."""
-    global active_symbols, active_symbols_updated_at
+    global active_symbols, active_symbols_updated_at, _refresh_counter
     try:
-        # v7.3.1: безопасный load_markets с retry на 418
-        # При initial=True уже вызван в startup_sequence, тут можно пропустить
-        # v7.3.9.7: УБРАН reload=True из hourly refresh — он был причиной
-        # всплеска памяти +100МБ каждый час (виден в MEMDIAG: RSS 305→405 на
-        # iter 52-53). reload=True форсил ccxt заново скачать и распарсить ВСЕ
-        # ~1400 рынков Binance Futures (~100МБ), при этом старый exchange.markets
-        # держался в памяти → пиковое удвоение → OOM на 512МБ Render.
-        # Теперь список активных монет строится из уже загруженного
-        # exchange.markets (load_markets был один раз на старте). Новые листинги
-        # подхватятся при следующем рестарте бота — это редкое событие, а
-        # стабильность памяти важнее. Нулевой всплеск.
-        if not initial and not exchange.markets:
-            # подстраховка: если markets почему-то пусты — загрузить (без reload)
-            _safe_load_markets(force_reload=False)
+        # ───────────────────────────────────────────────────────────────
+        # v7.3.9.9 (план Б): редкий reload для подхвата новых листингов.
+        # Обычный hourly refresh строит список из уже загруженного
+        # exchange.markets (нулевой всплеск). Раз в RELOAD_EVERY_N_REFRESH
+        # (240ч = 10 дней) делаем reload, НО только если RSS безопасный —
+        # иначе всплеск ~100МБ может пробить 512МБ. Если RSS высокий, reload
+        # откладывается до следующего refresh (счётчик не сбрасываем).
+        if not initial:
+            _refresh_counter += 1
+            do_reload = False
+            if _refresh_counter >= RELOAD_EVERY_N_REFRESH:
+                rss = _get_rss_mb()
+                if rss is None or rss < RELOAD_RSS_SAFETY_MB:
+                    do_reload = True
+                    _refresh_counter = 0  # сброс только при фактическом reload
+                    logging.info(
+                        f"♻️ план Б: reload markets (refresh #{RELOAD_EVERY_N_REFRESH}, "
+                        f"RSS={rss:.0f}MB < {RELOAD_RSS_SAFETY_MB}MB — безопасно)"
+                    )
+                else:
+                    logging.warning(
+                        f"⏸️ план Б: reload ОТЛОЖЕН (RSS={rss:.0f}MB ≥ "
+                        f"{RELOAD_RSS_SAFETY_MB}MB) — ждём следующего refresh"
+                    )
+            if do_reload:
+                _safe_load_markets(force_reload=True)
+                # после всплеска reload — сразу вернуть память в ОС
+                gc.collect()
+                _malloc_trim()
+            elif not exchange.markets:
+                # подстраховка: если markets пусты — загрузить (без reload)
+                _safe_load_markets(force_reload=False)
         # v7.3.7: tickers из WS-cache (или REST fallback при initial=True,
         # когда WS ещё не подключился — нам нужны volume сразу для warmup).
         if initial:
@@ -2493,10 +2544,22 @@ async def _ws_subscribe_batch(ws_ex, batch_syms, timeframe: str, batch_idx: int)
     """
     sym_tf_pairs = [[s, timeframe] for s in batch_syms]
     consecutive_errors = 0
+    # v7.3.9.8: WATCHDOG ПРОТИВ ТИХОГО ЗАВИСАНИЯ ccxt.pro.
+    # Известный баг ccxt.pro: watch_ohlcv_for_symbols может ВЕЧНО висеть на
+    # await, если WS-соединение тихо умерло (без исключения). Тогда свечи не
+    # приходят часами (в логах: 'WS свечи stale 7505с'), gather наверху не
+    # срабатывает (нет исключения) → переподключения нет. На 600 монетах сделки
+    # идут постоянно, поэтому если за WS_OHLCV_TIMEOUT секунд НИ ОДНОГО
+    # сообщения по батчу — соединение мертво. asyncio.wait_for бросит
+    # TimeoutError, прервёт зависший await → исключение → gather → reconnect.
+    WS_OHLCV_TIMEOUT = 180  # 3 минуты без единой свечи по батчу = соединение мертво
     while True:
         try:
             await _ws_async_wait_ban()
-            ohlcv_update = await ws_ex.watch_ohlcv_for_symbols(sym_tf_pairs)
+            ohlcv_update = await asyncio.wait_for(
+                ws_ex.watch_ohlcv_for_symbols(sym_tf_pairs),
+                timeout=WS_OHLCV_TIMEOUT
+            )
             consecutive_errors = 0  # сброс при успехе
             if isinstance(ohlcv_update, dict):
                 for sym, tf_dict in ohlcv_update.items():
@@ -2510,6 +2573,21 @@ async def _ws_subscribe_batch(ws_ex, batch_syms, timeframe: str, batch_idx: int)
                                 ws_status['connected'] = True
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            # v7.3.9.8: сработал watchdog — WS тихо завис. Закрываем мёртвое
+            # соединение и бросаем наверх, чтобы gather пересоздал ВСЁ заново
+            # (просто continue переиспользовал бы тот же дохлый сокет).
+            logging.warning(
+                f"⏱️ ws_batch[{timeframe}#{batch_idx}]: watchdog timeout "
+                f"({WS_OHLCV_TIMEOUT}s без свечей) — WS завис, пересоздаём соединение"
+            )
+            ws_status['errors'] += 1
+            ws_status['connected'] = False
+            try:
+                await ws_ex.close()
+            except Exception:
+                pass
+            raise  # наверх → gather завершится → outer reconnect
         except Exception as e:
             consecutive_errors += 1
             err_str = str(e)
@@ -2553,7 +2631,14 @@ async def _ws_watch_tickers():
             while True:
                 # watch_tickers(None) подписывается на !ticker@arr — весь рынок.
                 # Возвращает dict[symbol -> ticker] с уже накопленными обновлениями.
-                tickers_update = await ws_tickers_exchange.watch_tickers()
+                # v7.3.9.10: watchdog — тот же баг тихого зависания ccxt.pro, что
+                # и у свечей. Поток !ticker@arr идёт каждую секунду, поэтому 90с
+                # тишины = соединение мертво → wait_for бросит TimeoutError →
+                # пересоздание (раньше тикерный WS мог висеть мёртвым часами).
+                tickers_update = await asyncio.wait_for(
+                    ws_tickers_exchange.watch_tickers(),
+                    timeout=90
+                )
                 if tickers_update:
                     with ws_tickers_lock:
                         # Мерджим: новые обновления накладываются на старые.
@@ -2581,6 +2666,22 @@ async def _ws_watch_tickers():
             logging.info("ws_tickers: cancelled")
             ws_tickers_status['connected'] = False
             raise
+        except asyncio.TimeoutError:
+            # v7.3.9.10: watchdog тикеров — WS тих завис. Закрываем мёртвое
+            # соединение и переподключаемся (просто continue переиспользовал бы
+            # тот же дохлый сокет).
+            consecutive_errors += 1
+            ws_tickers_status['connected'] = False
+            logging.warning(
+                "⏱️ ws_tickers: watchdog timeout (90s без тиков) — "
+                "WS завис, пересоздаём соединение"
+            )
+            try:
+                await ws_tickers_exchange.close()
+            except Exception:
+                pass
+            await asyncio.sleep(WS_RECONNECT_MIN_SEC)
+            continue
         except Exception as e:
             consecutive_errors += 1
             ws_tickers_status['connected'] = False
@@ -2650,7 +2751,7 @@ def analyst_loop():
     # История ATR Map score для подсчёта mature_bars (сколько баров подряд score≥60).
     # Ключ: symbol → deque последних 12 score'ов (24h при cycle 6-7 мин).
     atr_map_score_history: dict = {}
-    logging.info("Аналитик Binance v7.3.9.7 (reload spike fix - root cause) запущен.")
+    logging.info("Аналитик Binance v7.3.9.10 (ticker REST-fallback ban fix + ticker watchdog) запущен.")
 
     # v7.3: ждём окончания прогрева истории
     while warmup_state['phase'] != 'done':
@@ -3309,7 +3410,7 @@ def health():
     else:
         tickers_str = "❌ disconnected"
 
-    return (f"✅ OK | Binance v7.3.9.7 (reload spike fix - root cause)\n"
+    return (f"✅ OK | Binance v7.3.9.10 (ticker REST-fallback ban fix + ticker watchdog)\n"
             f"Uptime: {uptime}\n"
             f"Итераций: {bot_status['iterations']}\n"
             f"Ошибок: {bot_status['errors']}\n"
